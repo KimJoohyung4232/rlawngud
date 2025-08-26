@@ -1,18 +1,23 @@
 # app.py
 import io
+import re
 from pathlib import Path
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch
+import requests
 from ultralytics import YOLO
 
 # ==================== 기본 설정 ====================
 st.set_page_config(page_title="YOLO 탐지기", page_icon="🧠", layout="centered")
 
 BASE_DIR = Path(__file__).parent
-MODEL_PATH = BASE_DIR / "best.pt"   # 같은 폴더에 best.pt 두기!
+MODEL_PATH = BASE_DIR / "best.pt"   # 모델 캐싱 경로
+
+# 구글 드라이브 파일 ID (주형이 올린 best.pt)
+GDRIVE_FILE_ID = "1DsRNTxESZM5LTEWuV-QgezYkQ386WcTp"
 
 DEVICE = "mps" if torch.backends.mps.is_available() else (
     "cuda" if torch.cuda.is_available() else "cpu"
@@ -30,34 +35,64 @@ KOR_LABELS = {
     "noodles": "면",
 }
 def to_kor(name: str) -> str:
-    key = str(name).strip().lower()
-    return KOR_LABELS.get(key, name)
+    return KOR_LABELS.get(str(name).strip().lower(), name)
 
-# ==================== 유틸 ====================
+# ==================== 유틸: 구글 드라이브에서 모델 다운로드 ====================
+def _gdrive_confirm_token(resp):
+    for k, v in resp.cookies.items():
+        if k.startswith("download_warning"):
+            return v
+    m = re.search(r"confirm=([0-9A-Za-z_]+)&", resp.text)
+    return m.group(1) if m else None
+
+def download_from_gdrive(file_id: str, dst: Path):
+    URL = "https://drive.google.com/uc?export=download"
+    with requests.Session() as s:
+        r = s.get(URL, params={"id": file_id}, stream=True)
+        token = _gdrive_confirm_token(r)
+        if token:
+            r = s.get(URL, params={"id": file_id, "confirm": token}, stream=True)
+
+        r.raise_for_status()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+# ==================== 폰트 유틸 ====================
+def get_korean_font(size=18):
+    """한글 폰트 로드: 프로젝트 fonts 폴더 우선, 없으면 기본 폰트"""
+    font_candidates = [
+        str(BASE_DIR / "fonts" / "NotoSansKR-Regular.ttf"),  # ✅ 프로젝트 포함
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",       # macOS 기본
+        "C:/Windows/Fonts/malgun.ttf",                      # Windows 맑은 고딕
+    ]
+    for p in font_candidates:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+# ==================== 모델 로드 ====================
 @st.cache_resource
 def load_model(path: Path):
     if not path.exists():
-        st.error(f"모델 파일이 없어요: {path}")
-        st.stop()
+        with st.spinner("모델 다운로드 중... (Google Drive)"):
+            try:
+                download_from_gdrive(GDRIVE_FILE_ID, path)
+            except Exception as e:
+                st.error(f"모델 다운로드 실패: {e}\n"
+                         "👉 구글 드라이브 공유 설정이 '링크가 있는 모든 사용자'인지 확인해줘.")
+                st.stop()
     return YOLO(str(path))
 
-def draw_boxes(pil_img: Image.Image, results, names_dict, use_korean=True, font_path=None):
-    """
-    YOLO 결과를 PIL로 그려서 반환.
-    - use_korean: True면 한글 매핑 사용(이미지에 한글 라벨 표시 시 폰트 필요)
-    - font_path: NotoSansKR 같은 TTF 경로. 없으면 기본 폰트(한글 미표시 가능)
-    """
+# ==================== 박스 드로잉 ====================
+def draw_boxes(pil_img: Image.Image, results, names_dict, font=None):
     img = pil_img.copy()
     draw = ImageDraw.Draw(img)
-
-    # 폰트 준비
-    if font_path is not None:
-        try:
-            font = ImageFont.truetype(font_path, size=18)
-        except Exception:
-            font = ImageFont.load_default()
-    else:
-        font = ImageFont.load_default()
+    font = font or get_korean_font(18)
 
     for r in results:
         if r.boxes is None:
@@ -67,24 +102,29 @@ def draw_boxes(pil_img: Image.Image, results, names_dict, use_korean=True, font_
             conf = float(box.conf[0].item())
             cls  = int(box.cls[0].item())
             cls_eng = names_dict.get(cls, str(cls))
-            cls_name = to_kor(cls_eng) if use_korean else cls_eng
+            cls_name = to_kor(cls_eng)
 
             # 박스
             draw.rectangle([(x1, y1), (x2, y2)], outline=(0, 255, 0), width=3)
 
             # 라벨 배경 + 텍스트
             label = f"{cls_name} {conf:.2f}"
-            tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+            try:
+                tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+            except Exception:
+                tw, th = font.getsize(label)
             pad = 4
-            bx2 = x1 + tw + pad * 2
-            by2 = y1 - th - pad * 2
-            if by2 < 0:
-                by2 = y1 + th + pad * 2  # 위에 못 그리면 박스 안쪽/아래쪽으로
-                ty = y1 + pad
+            if y1 - th - pad * 2 < 0:
+                bx1, by1 = x1, y1
+                bx2, by2 = x1 + tw + pad * 2, y1 + th + pad * 2
+                text_xy = (x1 + pad, y1 + pad)
             else:
-                ty = y1 - th - pad
-            draw.rectangle([(x1, y1), (bx2, by2)], fill=(0, 255, 0))
-            draw.text((x1 + pad, ty), label, font=font, fill=(0, 0, 0))
+                bx1, by1 = x1, y1 - th - pad * 2
+                bx2, by2 = x1 + tw + pad * 2, y1
+                text_xy = (x1 + pad, y1 - th - pad)
+
+            draw.rectangle([(bx1, by1), (bx2, by2)], fill=(0, 255, 0))
+            draw.text(text_xy, label, font=font, fill=(0, 0, 0))
 
     return img
 
@@ -93,8 +133,7 @@ def summarize_prediction(rows):
         return "아직 확신하기 어려워요. (탐지 결과 없음)"
     totals = {}
     for r in rows:
-        name = r["class_name"]
-        totals[name] = totals.get(name, 0.0) + float(r["conf"])
+        totals[r["class_name"]] = totals.get(r["class_name"], 0.0) + float(r["conf"])
     best_name = max(totals, key=totals.get)
     best_name_kor = to_kor(best_name)
     return f'이 사진은 **"{best_name_kor}"**으로 추정됩니다.'
@@ -141,23 +180,16 @@ if run_btn:
     else:
         with st.spinner("모델 추론 중..."):
             dv = "mps" if DEVICE == "mps" else (0 if DEVICE == "cuda" else "cpu")
-            img_np = np.array(st.session_state["uploaded_img"])  # RGB np.array
+            img_np = np.array(st.session_state["uploaded_img"])
             results = model.predict(
                 source=img_np, conf=conf_thres, iou=iou_thres,
                 verbose=False, device=dv
             )
-            names = model.names  # {idx: "class_name"}
+            names = model.names
 
-            # 결과 이미지 (폰트가 있으면 font_path에 경로 넣어줘)
-            out_img = draw_boxes(
-                st.session_state["uploaded_img"],
-                results, names,
-                use_korean=True,
-                font_path=None  # 예: str(BASE_DIR / "NotoSansKR-Regular.ttf")
-            )
+            out_img = draw_boxes(st.session_state["uploaded_img"], results, names)
             st.session_state["pred_img"] = out_img
 
-            # 표용 rows
             rows = []
             for r in results:
                 if r.boxes is None:
