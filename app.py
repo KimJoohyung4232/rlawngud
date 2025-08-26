@@ -14,16 +14,16 @@ from ultralytics import YOLO
 st.set_page_config(page_title="YOLO 탐지기", page_icon="🧠", layout="centered")
 
 BASE_DIR = Path(__file__).parent
-MODEL_PATH = BASE_DIR / "best.pt"   # 모델 캐싱 경로
+MODEL_PATH = BASE_DIR / "best.pt"   # 모델 캐싱 파일명
 
-# 구글 드라이브 파일 ID (주형이 올린 best.pt)
+# ✅ 주형이 드라이브에 올린 best.pt 파일 ID
 GDRIVE_FILE_ID = "1DsRNTxESZM5LTEWuV-QgezYkQ386WcTp"
 
 DEVICE = "mps" if torch.backends.mps.is_available() else (
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-# 영어 → 한글 매핑
+# ==================== 라벨 한글 매핑 ====================
 KOR_LABELS = {
     "jjajangmyeon": "짜장면",
     "jajangmyeon": "짜장면",
@@ -37,8 +37,9 @@ KOR_LABELS = {
 def to_kor(name: str) -> str:
     return KOR_LABELS.get(str(name).strip().lower(), name)
 
-# ==================== 유틸: 구글 드라이브에서 모델 다운로드 ====================
+# ==================== 구글드라이브 다운로드 유틸 ====================
 def _gdrive_confirm_token(resp):
+    # 큰 파일일 때 등장하는 경고 토큰 잡아오기
     for k, v in resp.cookies.items():
         if k.startswith("download_warning"):
             return v
@@ -52,7 +53,6 @@ def download_from_gdrive(file_id: str, dst: Path):
         token = _gdrive_confirm_token(r)
         if token:
             r = s.get(URL, params={"id": file_id, "confirm": token}, stream=True)
-
         r.raise_for_status()
         dst.parent.mkdir(parents=True, exist_ok=True)
         with open(dst, "wb") as f:
@@ -60,35 +60,31 @@ def download_from_gdrive(file_id: str, dst: Path):
                 if chunk:
                     f.write(chunk)
 
-# ==================== 폰트 유틸 ====================
+# ==================== 폰트 유틸 (윈/맥/리눅스 호환) ====================
 def get_korean_font(size=18):
-    """한글 폰트 로드: 프로젝트 fonts 폴더 우선, 없으면 기본 폰트"""
-    font_candidates = [
-        str(BASE_DIR / "fonts" / "NotoSansKR-Regular.ttf"),  # ✅ 프로젝트 포함
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",       # macOS 기본
-        "C:/Windows/Fonts/malgun.ttf",                      # Windows 맑은 고딕
+    candidates = [
+        str(BASE_DIR / "fonts" / "NotoSansKR-Regular.ttf"),  # 프로젝트 동봉
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",        # macOS
+        "C:/Windows/Fonts/malgun.ttf",                       # Windows
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",  # 리눅스
     ]
-    for p in font_candidates:
+    for p in candidates:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
             continue
     return ImageFont.load_default()
 
-# ==================== 모델 로드 ====================
+# ==================== 모델 로드 (캐시) ====================
 @st.cache_resource
 def load_model(path: Path):
-    if not path.exists():
+    if not path.exists() or path.stat().st_size < 10_000_000:  # 10MB 미만이면 재다운로드 가정
         with st.spinner("모델 다운로드 중... (Google Drive)"):
-            try:
-                download_from_gdrive(GDRIVE_FILE_ID, path)
-            except Exception as e:
-                st.error(f"모델 다운로드 실패: {e}\n"
-                         "👉 구글 드라이브 공유 설정이 '링크가 있는 모든 사용자'인지 확인해줘.")
-                st.stop()
+            download_from_gdrive(GDRIVE_FILE_ID, path)
+    # YOLO가 내부적으로 torch.load를 쓰는데, 배포 환경은 CPU 기준이라 map_location은 내부에서 처리됨
     return YOLO(str(path))
 
-# ==================== 박스 드로잉 ====================
+# ==================== 박스 그리기 ====================
 def draw_boxes(pil_img: Image.Image, results, names_dict, font=None):
     img = pil_img.copy()
     draw = ImageDraw.Draw(img)
@@ -107,14 +103,18 @@ def draw_boxes(pil_img: Image.Image, results, names_dict, font=None):
             # 박스
             draw.rectangle([(x1, y1), (x2, y2)], outline=(0, 255, 0), width=3)
 
-            # 라벨 배경 + 텍스트
+            # 라벨
             label = f"{cls_name} {conf:.2f}"
             try:
-                tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+                # textbbox: (left, top, right, bottom)
+                l, t, r, b = draw.textbbox((0, 0), label, font=font)
+                tw, th = r - l, b - t
             except Exception:
                 tw, th = font.getsize(label)
+
             pad = 4
             if y1 - th - pad * 2 < 0:
+                # 위에 공간 없으면 박스 안으로
                 bx1, by1 = x1, y1
                 bx2, by2 = x1 + tw + pad * 2, y1 + th + pad * 2
                 text_xy = (x1 + pad, y1 + pad)
@@ -138,6 +138,13 @@ def summarize_prediction(rows):
     best_name_kor = to_kor(best_name)
     return f'이 사진은 **"{best_name_kor}"**으로 추정됩니다.'
 
+def human_filesize(n):
+    for unit in ["B","KB","MB","GB"]:
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
 # ==================== UI ====================
 st.title("🧠 YOLO 객체 탐지 (Streamlit)")
 st.caption(f"Device: {DEVICE}")
@@ -146,7 +153,8 @@ with st.sidebar:
     st.subheader("설정")
     conf_thres = st.slider("Confidence", 0.1, 0.9, 0.25, 0.05)
     iou_thres  = st.slider("IoU", 0.1, 0.9, 0.45, 0.05)
-    st.write("모델:", f"`{MODEL_PATH.name}`")
+    size_txt = human_filesize(MODEL_PATH.stat().st_size) if MODEL_PATH.exists() else "없음"
+    st.write("모델 파일:", f"`{MODEL_PATH.name}` ({size_txt})")
     if st.button("🔄 초기화"):
         for k in ("pred_img", "det_rows", "summary_msg", "uploaded_img"):
             st.session_state.pop(k, None)
@@ -180,16 +188,18 @@ if run_btn:
     else:
         with st.spinner("모델 추론 중..."):
             dv = "mps" if DEVICE == "mps" else (0 if DEVICE == "cuda" else "cpu")
-            img_np = np.array(st.session_state["uploaded_img"])
+            img_np = np.array(st.session_state["uploaded_img"])  # RGB ndarray
             results = model.predict(
                 source=img_np, conf=conf_thres, iou=iou_thres,
                 verbose=False, device=dv
             )
-            names = model.names
+            names = model.names  # {idx: class_name}
 
+            # 결과 이미지
             out_img = draw_boxes(st.session_state["uploaded_img"], results, names)
             st.session_state["pred_img"] = out_img
 
+            # rows(표/JSON용)
             rows = []
             for r in results:
                 if r.boxes is None:
