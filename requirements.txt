@@ -1,0 +1,9 @@
+streamlit==1.48.1
+ultralytics
+torch
+torchvision
+torchaudio
+opencv-python-headless
+pillow
+numpy>=1.26,<2
+requests

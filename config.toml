@@ -1,0 +1,8 @@
+[server]
+headless = true
+enableXsrfProtection = true
+enableCORS = false
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"
