@@ -3,9 +3,8 @@ import io
 from pathlib import Path
 
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-
 import torch
 from ultralytics import YOLO
 
@@ -19,22 +18,18 @@ DEVICE = "mps" if torch.backends.mps.is_available() else (
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-# 영어 → 한글 매핑 (필요 시 계속 추가)
+# 영어 → 한글 매핑
 KOR_LABELS = {
-    # 짜장면 관련 다양한 스펠링 대비
     "jjajangmyeon": "짜장면",
     "jajangmyeon": "짜장면",
     "jjajang": "짜장면",
     "jajang": "짜장면",
     "blackbean_noodles": "짜장면",
     "blackbean": "짜장면",
-
     "ramen": "라면",
     "noodles": "면",
-    # ...
 }
 def to_kor(name: str) -> str:
-    # 소문자 normalize
     key = str(name).strip().lower()
     return KOR_LABELS.get(key, name)
 
@@ -46,26 +41,54 @@ def load_model(path: Path):
         st.stop()
     return YOLO(str(path))
 
-def draw_boxes(pil_img: Image.Image, results, names_dict):
-    """YOLO 결과 박스를 그려 PIL.Image로 반환 (라벨 한글화 포함)"""
-    img = np.array(pil_img)[:, :, ::-1].copy()  # RGB->BGR (cv2)
+def draw_boxes(pil_img: Image.Image, results, names_dict, use_korean=True, font_path=None):
+    """
+    YOLO 결과를 PIL로 그려서 반환.
+    - use_korean: True면 한글 매핑 사용(이미지에 한글 라벨 표시 시 폰트 필요)
+    - font_path: NotoSansKR 같은 TTF 경로. 없으면 기본 폰트(한글 미표시 가능)
+    """
+    img = pil_img.copy()
+    draw = ImageDraw.Draw(img)
+
+    # 폰트 준비
+    if font_path is not None:
+        try:
+            font = ImageFont.truetype(font_path, size=18)
+        except Exception:
+            font = ImageFont.load_default()
+    else:
+        font = ImageFont.load_default()
+
     for r in results:
         if r.boxes is None:
             continue
         for box in r.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int).tolist()
-            conf = float(box.conf[0].cpu().numpy())
-            cls  = int(box.cls[0].cpu().numpy())
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            conf = float(box.conf[0].item())
+            cls  = int(box.cls[0].item())
             cls_eng = names_dict.get(cls, str(cls))
-            cls_kor = to_kor(cls_eng)
-            label = f"{cls_kor} {conf:.2f}"
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img, label, (x1, max(y1 - 5, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-    return Image.fromarray(img[:, :, ::-1])  # BGR->RGB
+            cls_name = to_kor(cls_eng) if use_korean else cls_eng
+
+            # 박스
+            draw.rectangle([(x1, y1), (x2, y2)], outline=(0, 255, 0), width=3)
+
+            # 라벨 배경 + 텍스트
+            label = f"{cls_name} {conf:.2f}"
+            tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+            pad = 4
+            bx2 = x1 + tw + pad * 2
+            by2 = y1 - th - pad * 2
+            if by2 < 0:
+                by2 = y1 + th + pad * 2  # 위에 못 그리면 박스 안쪽/아래쪽으로
+                ty = y1 + pad
+            else:
+                ty = y1 - th - pad
+            draw.rectangle([(x1, y1), (bx2, by2)], fill=(0, 255, 0))
+            draw.text((x1 + pad, ty), label, font=font, fill=(0, 0, 0))
+
+    return img
 
 def summarize_prediction(rows):
-    """탐지 rows를 바탕으로 클래스별 conf 합산 후 한 줄 요약 (한글)"""
     if not rows:
         return "아직 확신하기 어려워요. (탐지 결과 없음)"
     totals = {}
@@ -125,11 +148,16 @@ if run_btn:
             )
             names = model.names  # {idx: "class_name"}
 
-            # 결과 이미지
-            out_img = draw_boxes(st.session_state["uploaded_img"], results, names)
+            # 결과 이미지 (폰트가 있으면 font_path에 경로 넣어줘)
+            out_img = draw_boxes(
+                st.session_state["uploaded_img"],
+                results, names,
+                use_korean=True,
+                font_path=None  # 예: str(BASE_DIR / "NotoSansKR-Regular.ttf")
+            )
             st.session_state["pred_img"] = out_img
 
-            # 표용 rows (라벨 한글화 저장)
+            # 표용 rows
             rows = []
             for r in results:
                 if r.boxes is None:
@@ -142,7 +170,7 @@ if run_btn:
                     cls_kor = to_kor(cls_eng)
                     rows.append({
                         "class_id": cls,
-                        "class_name": cls_kor,  # 한글
+                        "class_name": cls_kor,
                         "conf": round(conf, 4),
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2
                     })
@@ -156,12 +184,10 @@ if "pred_img" in st.session_state:
     st.markdown("### 3) 결과")
     st.image(st.session_state["pred_img"], caption="탐지 결과", use_container_width=True)
 
-    # 한 줄 요약(한글)
     msg = st.session_state.get("summary_msg")
     if msg:
         st.info(msg)
 
-    # ⚠ pandas/pyarrow 없이 안전하게 출력 (충돌 방지)
     if st.session_state.get("det_rows"):
         st.markdown("#### 탐지 박스 목록")
-        st.json(st.session_state["det_rows"])  # ← 표 대신 JSON으로 출력
+        st.json(st.session_state["det_rows"])
