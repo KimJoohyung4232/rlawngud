@@ -1,6 +1,7 @@
 # app.py
 import io
 import re
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -8,20 +9,22 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch
 import requests
+import gdown
 from ultralytics import YOLO
 
 # ==================== 기본 설정 ====================
 st.set_page_config(page_title="YOLO 탐지기", page_icon="🧠", layout="centered")
 
 BASE_DIR = Path(__file__).parent
-MODEL_PATH = BASE_DIR / "best.pt"  # 캐시될 위치
+MODEL_PATH = BASE_DIR / "best.pt"   # 캐시 저장 위치
 
-# 구글 드라이브 파일 ID (사용자 공유 링크의 /d/<ID>/ 부분)
+# ✅ 구글 드라이브 공유 링크의 파일 ID (너가 방금 준 새 링크)
+# https://drive.google.com/file/d/13Gpp2rOV24l8-_u3QtNlASZIlTRR3v7S/view?usp=share_link
 GDRIVE_FILE_ID = "13Gpp2rOV24l8-_u3QtNlASZIlTRR3v7S"
 
-
-DEVICE = "mps" if torch.backends.mps.is_available() else (
-    "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = (
+    "mps" if torch.backends.mps.is_available()
+    else ("cuda" if torch.cuda.is_available() else "cpu")
 )
 
 # 영어 → 한글 매핑
@@ -38,98 +41,98 @@ KOR_LABELS = {
 def to_kor(name: str) -> str:
     return KOR_LABELS.get(str(name).strip().lower(), name)
 
-# ==================== GDrive 다운로드 유틸 ====================
-def _gdrive_confirm_token(resp):
-    # 경고 확인 토큰 탐색 (쿠키 or HTML)
-    for k, v in resp.cookies.items():
-        if k.startswith("download_warning"):
-            return v
-    m = re.search(r"confirm=([0-9A-Za-z_]+)&", resp.text)
-    return m.group(1) if m else None
-
-def download_from_gdrive(file_id: str, dst: Path):
-    URL = "https://drive.google.com/uc?export=download"
-    with requests.Session() as s:
-        r = s.get(URL, params={"id": file_id}, stream=True, timeout=60)
-        token = _gdrive_confirm_token(r)
-        if token:
-            r = s.get(URL, params={"id": file_id, "confirm": token}, stream=True, timeout=60)
-        r.raise_for_status()
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with open(dst, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-def looks_like_html(path: Path) -> bool:
+# ==================== 안전 다운로드/검증 유틸 ====================
+def looks_like_html(file_path: Path, check_bytes: int = 2048) -> bool:
+    """파일 앞부분이 HTML처럼 보이면 True (드라이브 경고/미리보기 페이지가 저장된 경우 방지)"""
     try:
-        with open(path, "rb") as f:
-            head = f.read(512).lower()
-        return b"<html" in head or b"<!doctype html" in head
+        with open(file_path, "rb") as f:
+            head = f.read(check_bytes)
+        # 간단한 휴리스틱
+        head_l = head.lower()
+        return (
+            head_l.startswith(b"<!doctype html")
+            or b"<html" in head_l[:512]
+            or b"google" in head_l and b"drive" in head_l and b"<html" in head_l
+        )
     except Exception:
-        return True
+        return False
 
-def likely_broken(path: Path, min_mb: int = 5) -> bool:
-    if not path.exists():
+def likely_broken(file_path: Path) -> bool:
+    """사이즈가 비정상적으로 작거나/HTML이면 손상으로 판단"""
+    if not file_path.exists():
         return True
-    # 용량이 지나치게 작거나 HTML 느낌이면 손상으로 간주
-    if path.stat().st_size < min_mb * 1024 * 1024:
+    # pt가 1MB 미만이면 99% 이상 손상/HTML
+    if file_path.stat().st_size < 1_000_000:
         return True
-    if looks_like_html(path):
+    if looks_like_html(file_path):
         return True
     return False
 
-# ==================== 폰트 유틸 ====================
+def download_model_from_gdrive(file_id: str, dst: Path):
+    """gdown을 사용해서 Drive에서 확실히 받아오기 (confirm 자동 처리)"""
+    url = f"https://drive.google.com/uc?id={file_id}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    gdown.download(url, str(dst), quiet=False)
+
+def ensure_model_ok(path: Path):
+    """모델 파일이 정상인지 확인하고 문제면 재다운로드 후 검증. 실패 시 명확히 에러 표시."""
+    # 처음이거나 손상 의심이면 다운
+    if likely_broken(path):
+        # 기존 찌꺼기 삭제
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+        with st.spinner("📥 모델 파일을 Google Drive에서 다운로드 중..."):
+            download_model_from_gdrive(GDRIVE_FILE_ID, path)
+
+    # 다운받은 뒤에도 손상/HTML이면 중단
+    if likely_broken(path):
+        st.error(
+            "모델 파일 다운로드가 올바르지 않습니다. (HTML/손상 감지)\n"
+            "👉 Google Drive 공유가 **'링크가 있는 모든 사용자(보기)'** 인지 다시 확인해줘."
+        )
+        st.stop()
+
+    # torch로 가볍게 열어보며 유효성 최종 체크 (메모리 큰 로드 아님)
+    try:
+        # ckpt 헤더만 파싱되는지 확인
+        _ = torch.load(str(path), map_location="cpu")
+        # 메모리 사용 줄이기 위해 즉시 deref
+        del _
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    except Exception as e:
+        # 문제 있으면 파일 지우고 에러
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        st.error(f"모델 파일이 손상되었거나 호환되지 않습니다: {e}")
+        st.stop()
+
+# ==================== 모델 로드 ====================
+@st.cache_resource
+def load_model(path: Path):
+    ensure_model_ok(path)
+    return YOLO(str(path))
+
+# ==================== 그리기/요약 ====================
 def get_korean_font(size=18):
-    font_candidates = [
+    """한글 폰트 로드: 프로젝트/fonts 우선, 없으면 OS 기본, 마지막엔 기본폰트"""
+    candidates = [
         str(BASE_DIR / "fonts" / "NotoSansKR-Regular.ttf"),
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS
         "C:/Windows/Fonts/malgun.ttf",                 # Windows
     ]
-    for p in font_candidates:
+    for p in candidates:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
             continue
     return ImageFont.load_default()
 
-# ==================== 모델 로드(자동 복구 포함) ====================
-@st.cache_resource
-def load_model(path: Path):
-    """best.pt가 깨져있으면 1회 자동 재다운로드 후 재시도"""
-    def _ensure_ok():
-        if likely_broken(path):
-            # 기존 깨진 파일 삭제 후 재다운로드
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
-            download_from_gdrive(GDRIVE_FILE_ID, path)
-            # 그래도 이상하면 실패 처리
-            if likely_broken(path):
-                raise RuntimeError("모델 파일이 정상적으로 내려받히지 않았습니다.")
-
-    # 1차 점검/다운로드
-    _ensure_ok()
-
-    # 로드 시도 → 실패(UnpicklingError/EOF 등) 시 1회 더 새로 받고 재시도
-    try:
-        return YOLO(str(path))
-    except Exception as e_first:
-        # 손상 가능성: 다시 받아보고 한 번 더 시도
-        _ensure_ok()
-        try:
-            return YOLO(str(path))
-        except Exception as e_second:
-            raise RuntimeError(
-                f"YOLO 가중치를 열지 못했어요. (원인: {type(e_second).__name__})\n"
-                f"👉 구글 드라이브 공유가 '링크가 있는 모든 사용자'인지, "
-                f"또는 파일이 올바른 YOLOv8 PyTorch 가중치(.pt)인지 확인해주세요."
-            ) from e_second
-
-# ==================== 박스 드로잉 ====================
 def draw_boxes(pil_img: Image.Image, results, names_dict, font=None):
     img = pil_img.copy()
     draw = ImageDraw.Draw(img)
@@ -138,18 +141,20 @@ def draw_boxes(pil_img: Image.Image, results, names_dict, font=None):
     for r in results:
         if r.boxes is None:
             continue
-        for b in r.boxes:
-            x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
-            conf = float(b.conf[0].item())
-            cls  = int(b.cls[0].item())
-            cls_name = to_kor(names_dict.get(cls, str(cls)))
+        for box in r.boxes:
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            conf = float(box.conf[0].item())
+            cls  = int(box.cls[0].item())
+            cls_eng = names_dict.get(cls, str(cls))
+            cls_name = to_kor(cls_eng)
 
             # 박스
             draw.rectangle([(x1, y1), (x2, y2)], outline=(0, 255, 0), width=3)
 
-            # 라벨
+            # 라벨(배경 + 텍스트)
             label = f"{cls_name} {conf:.2f}"
             try:
+                # PIL>=9: textbbox
                 tw, th = draw.textbbox((0, 0), label, font=font)[2:]
             except Exception:
                 tw, th = font.getsize(label)
@@ -175,7 +180,8 @@ def summarize_prediction(rows):
     for r in rows:
         totals[r["class_name"]] = totals.get(r["class_name"], 0.0) + float(r["conf"])
     best_name = max(totals, key=totals.get)
-    return f'이 사진은 **"{to_kor(best_name)}"**으로 추정됩니다.'
+    best_name_kor = to_kor(best_name)
+    return f'이 사진은 **"{best_name_kor}"**으로 추정됩니다.'
 
 # ==================== UI ====================
 st.title("🧠 YOLO 객체 탐지 (Streamlit)")
@@ -183,17 +189,12 @@ st.caption(f"Device: {DEVICE}")
 
 with st.sidebar:
     st.subheader("설정")
-    conf_thres = st.slider("Confidence", 0.1, 0.9, 0.25, 0.05)
+    conf_thres = st.slider("Confidence", 0.1, 0.9, 0.30, 0.05)
     iou_thres  = st.slider("IoU", 0.1, 0.9, 0.45, 0.05)
     st.write("모델:", f"`{MODEL_PATH.name}`")
     if st.button("🔄 초기화"):
         for k in ("pred_img", "det_rows", "summary_msg", "uploaded_img"):
             st.session_state.pop(k, None)
-        try:
-            if MODEL_PATH.exists():
-                MODEL_PATH.unlink()  # 깨진 모델 캐시도 제거
-        except Exception:
-            pass
         st.rerun()
 
 # 업로드
@@ -216,7 +217,6 @@ if clear_btn:
     st.toast("결과 초기화!", icon="🧽")
 
 # ==================== 추론 ====================
-# (여기서 모델 로드가 일어나며, 손상이면 자동 복구)
 model = load_model(MODEL_PATH)
 
 if run_btn:
@@ -239,11 +239,12 @@ if run_btn:
             for r in results:
                 if r.boxes is None:
                     continue
-                for b in r.boxes:
-                    cls  = int(b.cls[0].item())
-                    conf = float(b.conf[0].item())
-                    x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
-                    cls_kor = to_kor(names.get(cls, str(cls)))
+                for box in r.boxes:
+                    cls  = int(box.cls[0].item())
+                    conf = float(box.conf[0].item())
+                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                    cls_eng = names.get(cls, str(cls))
+                    cls_kor = to_kor(cls_eng)
                     rows.append({
                         "class_id": cls,
                         "class_name": cls_kor,
@@ -252,6 +253,7 @@ if run_btn:
                     })
             st.session_state["det_rows"]  = rows
             st.session_state["summary_msg"] = summarize_prediction(rows)
+
         st.success("예측 완료!")
 
 # ==================== 결과 표시 ====================
