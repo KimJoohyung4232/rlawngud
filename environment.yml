@@ -1,0 +1,13 @@
+name: app
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - streamlit==1.48.1
+      - ultralytics
+      - pillow>=10.0
+      - numpy>=1.26,<2
+      - requests>=2.31
+      - opencv-python-headless>=4.8,<5
