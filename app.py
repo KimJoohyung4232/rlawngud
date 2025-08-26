@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / "best.pt"  # 캐시될 위치
 
 # 구글 드라이브 파일 ID (사용자 공유 링크의 /d/<ID>/ 부분)
-GDRIVE_FILE_ID = "1DsRNTxESZM5LTEWuV-QgezYkQ386WcTp"
+GDRIVE_FILE_ID = "13Gpp2rOV24l8-_u3QtNlASZIlTRR3v7S"
 
 DEVICE = "mps" if torch.backends.mps.is_available() else (
     "cuda" if torch.cuda.is_available() else "cpu"
