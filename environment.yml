@@ -4,10 +4,15 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  # ✅ GL 관련 런타임 라이브러리 추가 (libGL.so.1 제공)
+  - libgl
+  - libglib
+  - ffmpeg
   - pip:
       - streamlit==1.48.1
       - ultralytics
       - pillow>=10.0
       - numpy>=1.26,<2
       - requests>=2.31
-      - opencv-python-headless>=4.8,<5
+      # ✅ 반드시 headless로 고정 (GUI opencv와 충돌 방지)
+      - opencv-python-headless==4.8.1.78
