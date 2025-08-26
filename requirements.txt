@@ -3,7 +3,6 @@ ultralytics
 torch
 torchvision
 torchaudio
-opencv-python-headless
 pillow
 numpy>=1.26,<2
 requests
