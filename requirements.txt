@@ -1,8 +1,6 @@
 streamlit==1.48.1
 ultralytics
-torch
-torchvision
-torchaudio
-pillow
+opencv-python-headless>=4.8,<5
+pillow>=10.0
 numpy>=1.26,<2
-requests
+requests>=2.31
