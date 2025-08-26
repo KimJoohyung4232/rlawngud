@@ -1,7 +1,7 @@
 streamlit==1.48.1
-ultralytics
+ultralytics>=8.3.0
 pillow>=10.0
 numpy>=1.26,<2
 requests>=2.31
-opencv-python-headless==4.8.1.78 
+opencv-python-headless==4.8.1.78
 gdown
